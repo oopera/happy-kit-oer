@@ -1,0 +1,53 @@
+# Prueft bei jedem Push, dass README.md aus src/ aktuell ist und der Kurs
+# keine Konvertierungsfehler enthaelt, und legt Export-Artefakte ab.
+#
+# HINWEIS: Der Export-Schritt ist noch nicht ausgefuehrt worden -- der
+# LiaScript-Exporter liess sich in der Entwicklungsumgebung nicht starten.
+# Bitte beim ersten Lauf pruefen und ggf. die Formatliste anpassen.
+name: Kurs bauen
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: README.md ist aktuell?
+        run: python build.py --check
+
+      - name: Kurs pruefen
+        run: python tools/lint.py
+
+  exportieren:
+    needs: pruefen
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: SCORM- und PDF-Export
+        run: |
+          npm install -g @liascript/exporter
+          liaex -i README.md -f scorm2004 -o happy-kit-scorm
+          liaex -i README.md -f pdf       -o happy-kit
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: happy-kit-export
+          path: |
+            happy-kit-scorm*
+            happy-kit*.pdf

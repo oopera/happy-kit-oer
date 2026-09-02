@@ -1,0 +1,7 @@
+# Dateien oberhalb des Größenlimits werden nicht eingecheckt,
+# siehe docs/GROSSE-DATEIEN.md
+downloads/*foliensatz*.pptx
+
+__pycache__/
+*.pyc
+.DS_Store
