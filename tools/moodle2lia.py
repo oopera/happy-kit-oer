@@ -25,6 +25,7 @@ import re
 import shutil
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -90,9 +91,17 @@ class Html2Md(HTMLParser):
             self.out.append(s)
 
     def _block(self):
-        """Absatztrenner, ohne Leerzeilen zu haeufen."""
+        """Absatztrenner, ohne Leerzeilen zu haeufen.
+
+        Moodle laesst <strong> gerne ueber Absatzgrenzen hinweg offen. Markdown
+        kann Auszeichnung nicht ueber eine Leerzeile hinweg tragen -- deshalb
+        wird sie vor dem Umbruch geschlossen und danach wieder geoeffnet.
+        """
         if self.out and not "".join(self.out[-3:]).endswith("\n\n"):
+            offen = [m for m, d in self._wrap_depth.items() if d > 0]
+            self.out.extend(reversed(offen))
             self.out.append("\n\n")
+            self.out.extend(offen)
 
     # -- tags
     def handle_starttag(self, tag, attrs):
@@ -142,6 +151,15 @@ class Html2Md(HTMLParser):
             # Moodle-Einbettung (H5P) -- als Marker, wird spaeter ersetzt
             self._block()
             self._emit(f"<!--EMBED:{a.get('src','')}-->")
+        elif tag == "source":
+            # <video><source src=...> -- LiaScript-Videosyntax !?[](url)
+            src = self.resolve_img(a.get("src", ""))
+            if src:
+                self._block()
+                self._emit(f"!?[Video]({src})")
+            else:
+                self._block()
+                self._emit("*(Video, siehe `docs/GROSSE-DATEIEN.md`)*")
 
     def handle_endtag(self, tag):
         if tag in self.SKIP:
@@ -281,6 +299,7 @@ class Converter:
         self.oversized: list[dict] = []
         self.dropped: list[tuple[str, str]] = []
         self.warnings: list[str] = []
+        self.included: set[str] = set()       # sectionids, die uebernommen werden
 
     # ---------------------------------------------------------------- Dateien
     def _copy(self, meta: dict, kind: str) -> str | None:
@@ -345,7 +364,16 @@ class Converter:
                 return "#top"
             if kind == "FOLDERVIEWBYID":
                 act = self.b.by_module.get(ident)
-                return "#" + anchor(act["title"]) if act else "#top"
+                if not act:
+                    return "#top"
+                # Zeigt der Verweis in einen Abschnitt, der nicht mituebernommen
+                # wird (z. B. den versteckten Admin-Abschnitt), waere der Anker
+                # tot -- dann bleibt nur der Text stehen.
+                if self.included and act["sectionid"] not in self.included:
+                    self.warnings.append(
+                        f"Verweis auf nicht uebernommenen Inhalt: {act['title']}")
+                    return "#DROP"
+                return "#" + anchor(tool_title(act["title"]))
             if kind == "HVPEMBEDBYID":
                 return f"#DROP"
             if kind == "PLUGINFILEBYCONTEXT":
@@ -389,6 +417,41 @@ class Converter:
         return md.strip()
 
     # ------------------------------------------------------------------- H5P
+    def hvp(self, act: dict) -> str:
+        """H5P-Inhalt nach Markdown. Unterstuetzt Accordion und ImageSlider."""
+        h = act["root"].find(".//hvp")
+        data = json.loads(h.findtext("json_content") or "{}")
+        if "panels" in data:
+            return self.accordion(act)
+        if "imageSlides" in data:
+            return self.image_slider(act, data)
+        self.warnings.append(
+            f"H5P-Typ nicht unterstuetzt, uebersprungen: {act['title']}")
+        return ""
+
+    def image_slider(self, act: dict, data: dict) -> str:
+        """H5P.ImageSlider -> untereinander gesetzte Bilder mit Bildunterschrift."""
+        ctx = act["contextid"]
+        out = []
+        for slide in data.get("imageSlides", []):
+            img = slide.get("params", {}).get("image", {})
+            f = img.get("params", {}).get("file", {})
+            path = f.get("path", "")
+            if not path:
+                continue
+            # H5P haengt an Pfade gelegentlich ein Fragment an (…png#tmp)
+            meta = self._find_file(ctx, os.path.basename(path.split("#")[0]))
+            if not meta:
+                self.warnings.append(f"Bild nicht gefunden: {path}")
+                continue
+            rel = self._copy(meta, "media")
+            if not rel:
+                continue
+            alt = (img.get("params", {}).get("alt")
+                   or slide.get("params", {}).get("alt") or "")
+            out.append(f"![{alt}]({rel})")
+        return "\n\n".join(out)
+
     def accordion(self, act: dict) -> str:
         h = act["root"].find(".//hvp")
         data = json.loads(h.findtext("json_content") or "{}")
@@ -420,8 +483,19 @@ class Converter:
 
         # Werkzeuge = folder-Aktivitaeten; zugehoeriges Accordion per Titel matchen
         folders = [a for a in acts if a["modulename"] == "folder"]
-        accordions = {norm(a["title"].replace("Accordeon:", "")): a
-                      for a in acts if a["modulename"] == "hvp"}
+        pages = [a for a in acts if a["modulename"] == "page"]
+        hvps = [a for a in acts if a["modulename"] == "hvp"]
+        accordions = {norm(a["title"].replace("Accordeon:", "")): a for a in hvps}
+
+        # H5P-Inhalte, die zu keinem Ordner gehoeren (z. B. der Testimonials-
+        # Slider), werden weiter unten eigenstaendig ausgegeben.
+        names = display_titles(folders)
+        used = set()
+        for f in folders:
+            for k in match_keys(f["title"]):
+                if k in accordions:
+                    used.add(accordions[k]["moduleid"])
+                    break
 
         for a in acts:
             if a["modulename"] in SKIP_MODULES:
@@ -438,26 +512,39 @@ class Converter:
         if intro:
             lines += [intro, ""]
 
-        if folders:
+        entries = [names[f["moduleid"]] for f in folders] + [p["title"] for p in pages]
+        if len(entries) > 1:
             lines += ["In diesem Abschnitt findest du folgende Werkzeuge:", ""]
-            for f in folders:
-                lines.append(f"- [{tool_title(f['title'])}](#{anchor(tool_title(f['title']))})")
+            lines += [f"- [{e}](#{anchor(e)})" for e in entries]
             lines.append("")
 
-        for f in folders:
-            lines += self.tool(f, accordions)
+        # Reihenfolge des Kurses beibehalten
+        for a in acts:
+            if a["modulename"] == "folder":
+                lines += self.tool(a, accordions, names[a["moduleid"]])
+            elif a["modulename"] == "page":
+                lines += self.page(a)
+            elif a["modulename"] == "hvp" and a["moduleid"] not in used:
+                md = self.hvp(a)
+                if md:
+                    title = a["title"].replace("Accordeon:", "").strip()
+                    lines += ["", f"### {title}", "", md, ""]
 
-        return "\n".join(lines)
+        return normalize_headings("\n".join(lines))
 
-    def tool(self, folder: dict, accordions: dict) -> list[str]:
+    def page(self, act: dict) -> list[str]:
+        """mod_page -> eigener Unterabschnitt."""
+        ctx = act["contextid"]
+        md = drop_nav(self.html(act["root"].findtext(".//content") or "", ctx))
+        if not md.strip():
+            return []
+        return ["", f"### {act['title']}", "", md, ""]
+
+    def tool(self, folder: dict, accordions: dict, title: str) -> list[str]:
         ctx = folder["contextid"]
-        title = tool_title(folder["title"])
         raw_intro = folder["root"].findtext(".//intro") or ""
 
-        md = self.html(raw_intro, ctx)
-        # Navigationszeilen "Zurueck zur Uebersicht" entfernen
-        md = "\n".join(l for l in md.split("\n")
-                       if "Zurück zur Übersicht" not in l)
+        md = drop_nav(self.html(raw_intro, ctx))
         # Rating-/Feedback-Absatz entfernen. Die zugehoerigen choice-/feedback-
         # Aktivitaeten entfallen (siehe SKIP_MODULES), der Absatz wuerde sonst
         # mit toten Verweisen stehenbleiben.
@@ -480,9 +567,10 @@ class Converter:
         if md:
             out += [md, ""]
 
-        acc = accordions.get(norm(title))
+        acc = next((accordions[k] for k in match_keys(folder["title"])
+                    if k in accordions), None)
         if acc:
-            out += [self.accordion(acc), ""]
+            out += [self.hvp(acc), ""]
 
         # Materialien
         mats = [f for f in self.b.files_in(ctx, "content")]
@@ -507,10 +595,15 @@ INTERNAL_MOODLE = re.compile(r"https?://elearning\.hs-ruhrwest\.de/(?!pluginfile
 
 def md_cleanup(s: str) -> str:
     """Repariert die typischen Defekte, die aus Moodles TinyMCE-HTML entstehen."""
+    # Leere Auszeichnung MUSS zuerst weg. Word hinterlaesst <strong> </strong>,
+    # das hier als **** ankommt. Bliebe es stehen, wuerde der naechste Schritt
+    # eines dieser Sternchen mit einem weit entfernten ** paaren und damit die
+    # Paarbildung im gesamten Restdokument verschieben.
+    s = re.sub(r"\*\*\s*\*\*", "", s)
     # **fett ** / ** fett**  -> Leerzeichen aus der Auszeichnung herausziehen,
-    # sonst rendert Markdown die Sterne als Literale.
-    s = re.sub(r"\*\*(\s*)(.+?)(\s*)\*\*",
-               lambda m: f"{m.group(1)}**{m.group(2)}**{m.group(3)}", s, flags=re.S)
+    # sonst rendert Markdown die Sterne als Literale. Bewusst ohne re.S und
+    # ohne \n in der Mitte: Auszeichnung kann keinen Absatz ueberspannen.
+    s = re.sub(r"\*\*([ \t]*)([^\n]+?)([ \t]*)\*\*", r"\1**\2**\3", s)
     # **[**Text**](url)**  -> [**Text**](url)
     s = re.sub(r"\*\*\[\*\*(.+?)\*\*\]\((.*?)\)\*\*", r"[**\1**](\2)", s)
     # leere Ueberschriften (kamen aus <h3></h3>-Huellen)
@@ -526,10 +619,40 @@ def md_cleanup(s: str) -> str:
     return s.strip()
 
 
+def base_title(name: str) -> str:
+    return re.sub(r"^Anleitung\s+", "", name.strip())
+
+
 def tool_title(name: str) -> str:
-    """Ordnernamen wie 'Anleitung Positive Prompts' auf den Werkzeugnamen kuerzen."""
-    n = re.sub(r"^Anleitung\s+", "", name.strip())
-    return re.sub(r":\s.*$", "", n)          # "Belbin-Test: Finde ..." -> "Belbin-Test"
+    """Ordnernamen auf den Werkzeugnamen kuerzen.
+
+    'Belbin-Test: Finde deine Teamrolle' -> 'Belbin-Test'. Achtung: bei
+    'Check-in: Self-Monitoring' steht der Name HINTER dem Doppelpunkt, das
+    Kuerzen wuerde vier Werkzeuge auf 'Check-in' zusammenfallen lassen.
+    Deshalb entscheidet display_titles() anhand von Kollisionen, ob gekuerzt
+    wird -- diese Funktion liefert nur den Kurzvorschlag.
+    """
+    return re.sub(r":\s.*$", "", base_title(name)) or base_title(name)
+
+
+def display_titles(folders: list[dict]) -> dict[str, str]:
+    """Anzeigetitel je Ordner; kuerzt nur, solange das eindeutig bleibt."""
+    short = {f["moduleid"]: tool_title(f["title"]) for f in folders}
+    seen = Counter(short.values())
+    return {mid: (base_title(next(f["title"] for f in folders
+                                  if f["moduleid"] == mid))
+                  if seen[t] > 1 else t)
+            for mid, t in short.items()}
+
+
+def match_keys(name: str) -> list[str]:
+    """Schluesselkandidaten, um einen Ordner seinem Accordion zuzuordnen."""
+    n = base_title(name)
+    cands = [n]
+    if ":" in n:
+        before, after = n.split(":", 1)
+        cands += [after.strip(), before.strip()]
+    return [norm(c) for c in dict.fromkeys(cands) if c.strip()]
 
 
 def strip_headings(s: str) -> str:
@@ -537,9 +660,37 @@ def strip_headings(s: str) -> str:
     return re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
 
 
+def drop_nav(s: str) -> str:
+    """Moodle-Navigationszeilen entfernen (auch als Ueberschrift gesetzt)."""
+    return "\n".join(l for l in s.split("\n")
+                     if "Zurück zur Übersicht" not in l
+                     and "Zurück zur Hauptseite" not in l)
+
+
+def normalize_headings(s: str, start: int = 2) -> str:
+    """Uebersprungene Ueberschriftenebenen einebnen (h4 -> h6 wird h4 -> h5)."""
+    out, prev = [], start
+    for line in s.split("\n"):
+        m = re.match(r"^(#{1,6})(\s+)(.*)$", line)
+        if m:
+            lvl = len(m.group(1))
+            if lvl > prev + 1:
+                lvl = prev + 1
+            prev = lvl
+            line = "#" * lvl + m.group(2) + m.group(3)
+        out.append(line)
+    return "\n".join(out)
+
+
 def norm(s: str) -> str:
-    s = re.sub(r"^(anleitung|workbook)\s+", "", s.strip(), flags=re.I)
-    return re.sub(r"\W+", "", s.lower())
+    """Schluessel fuer den Abgleich Ordner <-> Accordion.
+
+    Hier darf NICHT nach Praefixen wie 'Workbook' gekuerzt werden: sonst
+    fallen 'Character Strengths' und 'Workbook Character Strengths' in
+    Abschnitt E auf denselben Schluessel und ein Accordion ueberschreibt
+    das andere. Das 'Anleitung '-Praefix entfernt bereits tool_title().
+    """
+    return re.sub(r"\W+", "", s.strip().lower())
 
 
 def anchor(title: str) -> str:
@@ -561,13 +712,18 @@ def main():
 
     b = Backup(args.backup)
     c = Converter(b, args.out, args.max_file_mb)
+    c.included = {s["id"] for s in b.sections.values()
+                  if s["number"] in set(args.section)}
 
     for num in args.section:
         sid = next((s["id"] for s in b.sections.values() if s["number"] == num), None)
         if sid is None:
             raise SystemExit(f"Abschnitt {num} nicht gefunden")
         md = c.section(sid)
-        name = f"{num:02d}-{anchor(b.sections[sid]['name'])}.md"
+        # Offset 10: generierte Abschnitte belegen 1x, der handgepflegte Kopf
+        # bleibt allein auf 00-. Sonst greift ein Aufraeum-Glob wie 00-* auch
+        # den Kopf ab -- genau das ist einmal passiert.
+        name = f"{10 + num:02d}-{anchor(b.sections[sid]['name'])}.md"
         dest = args.out / "src" / name
         dest.write_text(md + "\n", encoding="utf-8")
         print(f"geschrieben: src/{name}  ({len(md.splitlines())} Zeilen)")
