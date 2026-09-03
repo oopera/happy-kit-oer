@@ -21,9 +21,12 @@ blockquote { border-left: 4px solid #c7017f; }
 @end
 -->
 
-<!-- Sobald das Repository auf GitHub liegt, USER/REPO ersetzen: dann führt
-     dieser Badge von der GitHub-Seite direkt in den gerenderten Kurs. -->
-[![LiaScript](https://raw.githubusercontent.com/LiaScript/LiaScript/master/badges/course.svg)](https://liascript.github.io/course/?https://raw.githubusercontent.com/USER/REPO/main/README.md)
+<!-- ACHTUNG: Dieser Badge funktioniert erst, wenn das Repository oeffentlich
+     ist. LiaScript rendert clientseitig und braucht dafuer eine oeffentlich
+     abrufbare raw-URL; bei einem privaten Repository verlangt
+     raw.githubusercontent.com ein Token und der Kurs bleibt leer.
+     Solange das Repository privat ist: `python tools/serve.py`. -->
+[![LiaScript](https://raw.githubusercontent.com/LiaScript/LiaScript/master/badges/course.svg)](https://liascript.github.io/course/?https://raw.githubusercontent.com/oopera/happy-kit-oer/main/README.md)
 
 # Happy Kit 2.0
 
